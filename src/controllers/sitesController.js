@@ -1,78 +1,130 @@
-const { pool } = require('../config/db');
+const Site = require('../models/Site');
+const Worker = require('../models/Worker');
+const Expense = require('../models/Expense');
 
+// Get all sites with admin count, worker count, total approved expenses
 const getAllSites = async (req, res) => {
   try {
-    const [rows] = await pool.query(
-      `SELECT s.*, 
-        (SELECT COUNT(*) FROM users u WHERE u.site_id = s.id AND u.role='siteadmin') as admin_count,
-        (SELECT COUNT(*) FROM workers w WHERE w.site_id = s.id) as worker_count,
-        (SELECT COALESCE(SUM(amount),0) FROM expenses e WHERE e.site_id = s.id AND e.status='approved') as total_expenses
-       FROM sites s ORDER BY s.created_at DESC`
-    );
-    res.json(rows);
+    const sites = await Site.aggregate([
+      {
+        $lookup: {
+          from: 'users', // Assuming a User collection exists
+          localField: '_id',
+          foreignField: 'site_id',
+          as: 'admins',
+        },
+      },
+      {
+        $addFields: {
+          admin_count: {
+            $size: {
+              $filter: {
+                input: '$admins',
+                as: 'admin',
+                cond: { $eq: ['$$admin.role', 'siteadmin'] },
+              },
+            },
+          },
+        },
+      },
+      {
+        $lookup: {
+          from: 'workers',
+          localField: '_id',
+          foreignField: 'site_id',
+          as: 'workers',
+        },
+      },
+      { $addFields: { worker_count: { $size: '$workers' } } },
+      {
+        $lookup: {
+          from: 'expenses',
+          let: { siteId: '$_id' },
+          pipeline: [
+            { $match: { $expr: { $and: [ { $eq: ['$site_id', '$$siteId'] }, { $eq: ['$status', 'approved'] } ] } } },
+            { $group: { _id: null, total: { $sum: '$amount' } } },
+          ],
+          as: 'expenseAgg',
+        },
+      },
+      {
+        $addFields: {
+          total_expenses: { $ifNull: [{ $arrayElemAt: ['$expenseAgg.total', 0] }, 0] },
+        },
+      },
+      { $project: { admins: 0, workers: 0, expenseAgg: 0 } },
+    ]);
+    res.json(sites);
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Internal server error.' });
   }
 };
 
+// Get a single site by ID
 const getSiteById = async (req, res) => {
   try {
-    const [rows] = await pool.query('SELECT * FROM sites WHERE id = ?', [req.params.id]);
-    if (rows.length === 0) return res.status(404).json({ message: 'Site not found.' });
-    res.json(rows[0]);
+    const site = await Site.findById(req.params.id);
+    if (!site) return res.status(404).json({ message: 'Site not found.' });
+    res.json(site);
   } catch (err) {
+    console.error(err);
     res.status(500).json({ message: 'Internal server error.' });
   }
 };
 
+// Create a new site
 const createSite = async (req, res) => {
   try {
     const { name, location } = req.body;
     if (!name) return res.status(400).json({ message: 'Site name is required.' });
-    const [result] = await pool.query(
-      'INSERT INTO sites (name, location) VALUES (?, ?)',
-      [name, location || '']
-    );
-    const [newSite] = await pool.query('SELECT * FROM sites WHERE id = ?', [result.insertId]);
-    res.status(201).json(newSite[0]);
+    const newSite = await Site.create({ name, location });
+    res.status(201).json(newSite);
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Internal server error.' });
   }
 };
 
+// Update an existing site
 const updateSite = async (req, res) => {
   try {
     const { name, location, is_active } = req.body;
-    await pool.query(
-      'UPDATE sites SET name = ?, location = ?, is_active = ? WHERE id = ?',
-      [name, location, is_active, req.params.id]
+    const updated = await Site.findByIdAndUpdate(
+      req.params.id,
+      { name, location, is_active },
+      { new: true }
     );
-    const [updated] = await pool.query('SELECT * FROM sites WHERE id = ?', [req.params.id]);
-    res.json(updated[0]);
+    if (!updated) return res.status(404).json({ message: 'Site not found.' });
+    res.json(updated);
   } catch (err) {
+    console.error(err);
     res.status(500).json({ message: 'Internal server error.' });
   }
 };
 
+// Delete a site
 const deleteSite = async (req, res) => {
   try {
-    await pool.query('DELETE FROM sites WHERE id = ?', [req.params.id]);
+    const result = await Site.findByIdAndDelete(req.params.id);
+    if (!result) return res.status(404).json({ message: 'Site not found.' });
     res.json({ message: 'Site deleted successfully.' });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ message: 'Internal server error.' });
   }
 };
 
+// Toggle site active status
 const toggleSiteStatus = async (req, res) => {
   try {
-    const [rows] = await pool.query('SELECT * FROM sites WHERE id = ?', [req.params.id]);
-    if (rows.length === 0) return res.status(404).json({ message: 'Site not found.' });
-    const newStatus = rows[0].is_active ? 0 : 1;
-    await pool.query('UPDATE sites SET is_active = ? WHERE id = ?', [newStatus, req.params.id]);
-    res.json({ message: `Site ${newStatus ? 'activated' : 'deactivated'} successfully.`, is_active: newStatus });
+    const site = await Site.findById(req.params.id);
+    if (!site) return res.status(404).json({ message: 'Site not found.' });
+    site.is_active = !site.is_active;
+    await site.save();
+    res.json({ message: `Site ${site.is_active ? 'activated' : 'deactivated'} successfully.`, is_active: site.is_active });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ message: 'Internal server error.' });
   }
 };

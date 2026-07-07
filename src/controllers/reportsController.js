@@ -1,103 +1,105 @@
-const { pool } = require('../config/db');
+const Site = require('../models/Site');
+const Worker = require('../models/Worker');
+const Material = require('../models/Material');
+const Expense = require('../models/Expense');
 
 // Dashboard summary for Super Admin
 const getDashboardStats = async (req, res) => {
   try {
-    // mysql2/promise returns: [rows, fields]
-    // Run totals in parallel with correct destructuring.
-    let total_sites = 0;
-    let active_sites = 0;
-    let total_workers = 0;
-    let total_payments = 0;
-    let total_expenses = 0;
-    let total_material_cost = 0;
+    // Parallel Mongoose queries for totals
+    const [totalSites, activeSites, totalWorkers, totalPaymentsAgg, totalExpensesAgg, totalMaterialCostAgg] = await Promise.all([
+      Site.countDocuments(),
+      Site.countDocuments({ is_active: true }),
+      Worker.countDocuments(),
+      Worker.aggregate([{ $group: { _id: null, total: { $sum: '$total_amount' } } }]),
+      Expense.aggregate([{ $match: { status: 'approved' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+      Material.aggregate([{ $group: { _id: null, total: { $sum: '$total_amount' } } }]),
+    ]);
 
-    let q1, q2, q3, q4, q5, q6;
-    try {
-      [q1, q2, q3, q4, q5, q6] = await Promise.all([
-        pool.query('SELECT COUNT(*) as total_sites FROM sites'),
-        pool.query('SELECT COUNT(*) as active_sites FROM sites WHERE is_active = 1'),
-        pool.query('SELECT COUNT(*) as total_workers FROM workers'),
-        pool.query('SELECT COALESCE(SUM(total_amount),0) as total_payments FROM workers'),
-        pool.query('SELECT COALESCE(SUM(amount),0) as total_expenses FROM expenses WHERE status="approved"'),
-        pool.query('SELECT COALESCE(SUM(total_amount),0) as total_material_cost FROM materials'),
-      ]);
-    } catch (err) {
-      console.error('[reports/dashboard] Failed totals Promise.all:', {
-        message: err?.message,
-        code: err?.code,
-        errno: err?.errno,
-        sqlMessage: err?.sqlMessage,
-        sql: err?.sql,
-      });
-      throw err;
-    }
+    const totalPayments = totalPaymentsAgg[0]?.total ?? 0;
+    const totalExpenses = totalExpensesAgg[0]?.total ?? 0;
+    const totalMaterialCost = totalMaterialCostAgg[0]?.total ?? 0;
 
+    // Expense breakdown by head (top 8)
+    const expenseBreakdown = await Expense.aggregate([
+      { $match: { status: 'approved' } },
+      { $group: { _id: '$expense_head', value: { $sum: '$amount' } } },
+      { $project: { name: '$_id', value: 1, _id: 0 } },
+      { $sort: { value: -1 } },
+      { $limit: 8 },
+    ]);
 
-    total_sites = q1[0]?.total_sites ?? 0;
-    active_sites = q2[0]?.active_sites ?? 0;
-    total_workers = q3[0]?.total_workers ?? 0;
-    total_payments = q4[0]?.total_payments ?? 0;
-    total_expenses = q5[0]?.total_expenses ?? 0;
-    total_material_cost = q6[0]?.total_material_cost ?? 0;
+    // Site‑wise expenses with payments and materials
+    const siteWiseExpenses = await Site.aggregate([
+      {
+        $lookup: {
+          from: 'expenses',
+          let: { siteId: '$_id' },
+          pipeline: [
+            { $match: { $expr: { $and: [{ $eq: ['$site_id', '$$siteId'] }, { $eq: ['$status', 'approved'] }] } } },
+            { $group: { _id: null, expenses: { $sum: '$amount' } } },
+          ],
+          as: 'exp'
+        }
+      },
+      { $unwind: { path: '$exp', preserveNullAndEmptyArrays: true } },
+      {
+        $lookup: {
+          from: 'workers',
+          localField: '_id',
+          foreignField: 'site_id',
+          as: 'workers'
+        }
+      },
+      {
+        $lookup: {
+          from: 'materials',
+          localField: '_id',
+          foreignField: 'site_id',
+          as: 'materials'
+        }
+      },
+      {
+        $addFields: {
+          expenses: { $ifNull: ['$exp.expenses', 0] },
+          payments: { $sum: '$workers.total_amount' },
+          materials: { $sum: '$materials.total_amount' }
+        }
+      },
+      { $project: { name: '$name', expenses: 1, payments: 1, materials: 1, _id: 0 } },
+    ]);
 
-    let expenseBreakdown, siteWiseExpenses, monthlyExpenses;
-
-    // Expense breakdown by head
-    try {
-      [expenseBreakdown] = await pool.query(
-        `SELECT expense_head as name, SUM(amount) as value 
-         FROM expenses WHERE status='approved' GROUP BY expense_head ORDER BY value DESC LIMIT 8`
-      );
-    } catch (e) {
-      console.error('[reports/dashboard] expenseBreakdown query failed:', e);
-      throw e;
-    }
-
-    // Site-wise expenses
-    try {
-      [siteWiseExpenses] = await pool.query(
-        `SELECT s.name, 
-          COALESCE(SUM(e.amount),0) as expenses,
-          COALESCE((SELECT SUM(w.total_amount) FROM workers w WHERE w.site_id = s.id),0) as payments,
-          COALESCE((SELECT SUM(m.total_amount) FROM materials m WHERE m.site_id = s.id),0) as materials
-         FROM sites s
-         LEFT JOIN expenses e ON e.site_id = s.id AND e.status='approved'
-         GROUP BY s.id, s.name`
-      );
-    } catch (e) {
-      console.error('[reports/dashboard] siteWiseExpenses query failed:', e);
-      throw e;
-    }
-
-    // Monthly expenses (last 6 months)
-    try {
-      [monthlyExpenses] = await pool.query(
-        `SELECT
-           DATE_FORMAT(date, '%b %Y') AS month,
-           YEAR(date) AS y,
-           MONTH(date) AS m,
-           SUM(amount) AS total
-         FROM expenses
-         WHERE status='approved'
-           AND date >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
-         GROUP BY YEAR(date), MONTH(date), month
-         ORDER BY y, m`
-      );
-    } catch (e) {
-      console.error('[reports/dashboard] monthlyExpenses query failed:', e);
-      throw e;
-    }
-
+    // Monthly expenses for the last 6 months
+    const sixMonthsAgo = new Date();
+    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 5);
+    const monthlyExpenses = await Expense.aggregate([
+      { $match: { status: 'approved', date: { $gte: sixMonthsAgo } } },
+      {
+        $group: {
+          _id: { year: { $year: '$date' }, month: { $month: '$date' } },
+          total: { $sum: '$amount' }
+        }
+      },
+      {
+        $project: {
+          month: { $dateToString: { format: '%b %Y', date: { $dateFromParts: { year: '$_id.year', month: '$_id.month', day: 1 } } } },
+          y: '$_id.year',
+          m: '$_id.month',
+          total: 1,
+          _id: 0
+        }
+      },
+      { $sort: { y: 1, m: 1 } },
+    ]);
 
     const payload = {
       stats: {
-        total_sites,
-        active_sites,
-        total_workers,
-        total_payments,
-        total_expenses,
-        total_material_cost,
+        total_sites: totalSites,
+        active_sites: activeSites,
+        total_workers: totalWorkers,
+        total_payments: totalPayments,
+        total_expenses: totalExpenses,
+        total_material_cost: totalMaterialCost,
       },
       expenseBreakdown,
       siteWiseExpenses,
@@ -124,25 +126,27 @@ const getSiteDashboard = async (req, res) => {
     const siteId = req.user.role === 'siteadmin' ? req.user.site_id : req.query.site_id;
     if (!siteId) return res.status(400).json({ message: 'site_id required.' });
 
-    const [[{ worker_count }]] = await pool.query('SELECT COUNT(*) as worker_count FROM workers WHERE site_id=?', [siteId]);
-    const [[{ total_wages }]] = await pool.query('SELECT COALESCE(SUM(total_amount),0) as total_wages FROM workers WHERE site_id=?', [siteId]);
-    const [[{ material_cost }]] = await pool.query('SELECT COALESCE(SUM(total_amount),0) as material_cost FROM materials WHERE site_id=?', [siteId]);
-    const [[{ expense_total }]] = await pool.query('SELECT COALESCE(SUM(amount),0) as expense_total FROM expenses WHERE site_id=? AND status="approved"', [siteId]);
-    const [[{ pending_expenses }]] = await pool.query('SELECT COUNT(*) as pending_expenses FROM expenses WHERE site_id=? AND status="pending"', [siteId]);
+    const [workerCount, totalWages, materialCost, expenseTotal, pendingExpenses] = await Promise.all([
+      Worker.countDocuments({ site_id: siteId }),
+      Worker.aggregate([{ $match: { site_id: siteId } }, { $group: { _id: null, total: { $sum: '$total_amount' } } }]),
+      Material.aggregate([{ $match: { site_id: siteId } }, { $group: { _id: null, total: { $sum: '$total_amount' } } }]),
+      Expense.aggregate([ { $match: { site_id: siteId, status: 'approved' } }, { $group: { _id: null, total: { $sum: '$amount' } } } ]),
+      Expense.countDocuments({ site_id: siteId, status: 'pending' })
+    ]);
 
-    // Recent materials
-    const [recentMaterials] = await pool.query(
-      'SELECT * FROM materials WHERE site_id=? ORDER BY created_at DESC LIMIT 5', [siteId]
-    );
+    const totalWagesVal = totalWages[0]?.total ?? 0;
+    const materialCostVal = materialCost[0]?.total ?? 0;
+    const expenseTotalVal = expenseTotal[0]?.total ?? 0;
 
-    // Material cost by type
-    const [materialBreakdown] = await pool.query(
-      `SELECT material_type as name, SUM(total_amount) as value FROM materials WHERE site_id=? GROUP BY material_type`,
-      [siteId]
-    );
+    const recentMaterials = await Material.find({ site_id: siteId }).sort({ created_at: -1 }).limit(5);
+    const materialBreakdown = await Material.aggregate([
+      { $match: { site_id: siteId } },
+      { $group: { _id: '$material_type', value: { $sum: '$total_amount' } } },
+      { $project: { name: '$_id', value: 1, _id: 0 } }
+    ]);
 
     res.json({
-      stats: { worker_count, total_wages, material_cost, expense_total, pending_expenses },
+      stats: { worker_count: workerCount, total_wages: totalWagesVal, material_cost: materialCostVal, expense_total: expenseTotalVal, pending_expenses: pendingExpenses },
       recentMaterials,
       materialBreakdown,
     });
@@ -159,21 +163,14 @@ const getDailyReport = async (req, res) => {
     let siteFilter = site_id ? parseInt(site_id) : null;
     if (req.user.role === 'siteadmin') siteFilter = req.user.site_id;
 
-    const siteClause = siteFilter ? 'AND site_id = ?' : '';
-    const params = siteFilter ? [reportDate, siteFilter] : [reportDate];
+    const match = { date: new Date(reportDate) };
+    if (siteFilter) match.site_id = siteFilter;
 
-    const [materials] = await pool.query(
-      `SELECT m.*, s.name as site_name FROM materials m LEFT JOIN sites s ON m.site_id = s.id WHERE m.date = ? ${siteClause} ORDER BY m.site_id`,
-      params
-    );
-    const [workers] = await pool.query(
-      `SELECT w.*, s.name as site_name FROM workers w LEFT JOIN sites s ON w.site_id = s.id WHERE w.work_period_start <= ? AND w.work_period_end >= ? ${siteClause} ORDER BY w.site_id`,
-      siteFilter ? [reportDate, reportDate, siteFilter] : [reportDate, reportDate]
-    );
-    const [expenses] = await pool.query(
-      `SELECT e.*, s.name as site_name FROM expenses e LEFT JOIN sites s ON e.site_id = s.id WHERE e.date = ? ${siteClause} ORDER BY e.site_id`,
-      params
-    );
+    const [materials, workers, expenses] = await Promise.all([
+      Material.find(match).populate('site_id', 'name'),
+      Worker.find({ work_period_start: { $lte: new Date(reportDate) }, work_period_end: { $gte: new Date(reportDate) }, ...(siteFilter && { site_id: siteFilter }) }).populate('site_id', 'name'),
+      Expense.find(match).populate('site_id', 'name'),
+    ]);
 
     res.json({ date: reportDate, materials, workers, expenses });
   } catch (err) {
@@ -185,41 +182,46 @@ const getDailyReport = async (req, res) => {
 const getMonthlyReport = async (req, res) => {
   try {
     const { month, year, site_id } = req.query;
-    const m = month || new Date().getMonth() + 1;
-    const y = year || new Date().getFullYear();
+    const m = month ? parseInt(month) : new Date().getMonth() + 1;
+    const y = year ? parseInt(year) : new Date().getFullYear();
     let siteFilter = site_id ? parseInt(site_id) : null;
     if (req.user.role === 'siteadmin') siteFilter = req.user.site_id;
 
-    const siteClause = siteFilter ? 'AND site_id = ?' : '';
-    const buildParams = (...base) => siteFilter ? [...base, siteFilter] : base;
+    const match = { $expr: { $and: [{ $eq: [{ $month: '$date' }, m] }, { $eq: [{ $year: '$date' }, y] }] } };
+    if (siteFilter) match.site_id = siteFilter;
 
-    const [materialSummary] = await pool.query(
-      `SELECT material_type, SUM(quantity) as qty, SUM(total_amount) as total
-       FROM materials WHERE MONTH(date)=? AND YEAR(date)=? ${siteClause} GROUP BY material_type`,
-      buildParams(m, y)
-    );
+    const [materialSummary, workerSummary, expenseSummary, totals] = await Promise.all([
+      Material.aggregate([
+        { $match: { $expr: { $and: [{ $eq: [{ $month: '$date' }, m] }, { $eq: [{ $year: '$date' }, y] }] } } },
+        ...(siteFilter ? [{ $match: { site_id: siteFilter } }] : []),
+        { $group: { _id: '$material_type', qty: { $sum: '$quantity' }, total: { $sum: '$total_amount' } } },
+        { $project: { material_type: '$_id', qty: 1, total: 1, _id: 0 } }
+      ]),
+      Worker.aggregate([
+        { $match: { $expr: { $and: [{ $eq: [{ $month: '$work_period_start' }, m] }, { $eq: [{ $year: '$work_period_start' }, y] }] } } },
+        ...(siteFilter ? [{ $match: { site_id: siteFilter } }] : []),
+        { $group: { _id: '$profession', count: { $sum: 1 }, total: { $sum: '$total_amount' } } },
+        { $project: { profession: '$_id', count: 1, total: 1, _id: 0 } }
+      ]),
+      Expense.aggregate([
+        { $match: { $expr: { $and: [{ $eq: [{ $month: '$date' }, m] }, { $eq: [{ $year: '$date' }, y] }, { $eq: ['$status', 'approved'] }] } } },
+        ...(siteFilter ? [{ $match: { site_id: siteFilter } }] : []),
+        { $group: { _id: '$expense_head', total: { $sum: '$amount' }, count: { $sum: 1 } } },
+        { $project: { expense_head: '$_id', total: 1, count: 1, _id: 0 } }
+      ]),
+      // Totals across collections
+      Promise.all([
+        Material.aggregate([{ $match: { $expr: { $and: [{ $eq: [{ $month: '$date' }, m] }, { $eq: [{ $year: '$date' }, y] }] } } }, ...(siteFilter ? [{ $match: { site_id: siteFilter } }] : []), { $group: { _id: null, total: { $sum: '$total_amount' } } }]),
+        Worker.aggregate([{ $match: { $expr: { $and: [{ $eq: [{ $month: '$work_period_start' }, m] }, { $eq: [{ $year: '$work_period_start' }, y] }] } }, ...(siteFilter ? [{ $match: { site_id: siteFilter } }] : []), { $group: { _id: null, total: { $sum: '$total_amount' } } }]),
+        Expense.aggregate([{ $match: { $expr: { $and: [{ $eq: [{ $month: '$date' }, m] }, { $eq: [{ $year: '$date' }, y] }, { $eq: ['$status', 'approved'] }] } }, ...(siteFilter ? [{ $match: { site_id: siteFilter } }] : []), { $group: { _id: null, total: { $sum: '$amount' } } }])
+      ]),
+    ]);
 
-    const [workerSummary] = await pool.query(
-      `SELECT profession, COUNT(*) as count, SUM(total_amount) as total
-       FROM workers WHERE MONTH(work_period_start)=? AND YEAR(work_period_start)=? ${siteClause} GROUP BY profession`,
-      buildParams(m, y)
-    );
+    const materialTotal = materialSummary[0]?.total ?? 0;
+    const workerTotal = workerSummary[0]?.total ?? 0;
+    const expenseTotal = expenseSummary[0]?.total ?? 0;
 
-    const [expenseSummary] = await pool.query(
-      `SELECT expense_head, SUM(amount) as total, COUNT(*) as count
-       FROM expenses WHERE MONTH(date)=? AND YEAR(date)=? AND status='approved' ${siteClause} GROUP BY expense_head`,
-      buildParams(m, y)
-    );
-
-    const [[totals]] = await pool.query(
-      `SELECT 
-        (SELECT COALESCE(SUM(total_amount),0) FROM materials WHERE MONTH(date)=? AND YEAR(date)=? ${siteClause}) as material_total,
-        (SELECT COALESCE(SUM(total_amount),0) FROM workers WHERE MONTH(work_period_start)=? AND YEAR(work_period_start)=? ${siteClause}) as worker_total,
-        (SELECT COALESCE(SUM(amount),0) FROM expenses WHERE MONTH(date)=? AND YEAR(date)=? AND status='approved' ${siteClause}) as expense_total`,
-      siteFilter ? [m, y, siteFilter, m, y, siteFilter, m, y, siteFilter] : [m, y, m, y, m, y]
-    );
-
-    res.json({ month: m, year: y, totals, materialSummary, workerSummary, expenseSummary });
+    res.json({ month: m, year: y, totals: { material_total: materialTotal, worker_total: workerTotal, expense_total: expenseTotal }, materialSummary, workerSummary, expenseSummary });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Internal server error.' });
@@ -228,27 +230,26 @@ const getMonthlyReport = async (req, res) => {
 
 const getSiteWiseReport = async (req, res) => {
   try {
-    const [sites] = await pool.query('SELECT * FROM sites ORDER BY name');
-    const result = [];
-    for (const site of sites) {
-      const [[mats]] = await pool.query(
-        'SELECT COALESCE(SUM(total_amount),0) as total FROM materials WHERE site_id=?', [site.id]
-      );
-      const [[wkrs]] = await pool.query(
-        'SELECT COUNT(*) as count, COALESCE(SUM(total_amount),0) as total FROM workers WHERE site_id=?', [site.id]
-      );
-      const [[exps]] = await pool.query(
-        'SELECT COALESCE(SUM(amount),0) as total FROM expenses WHERE site_id=? AND status="approved"', [site.id]
-      );
-      result.push({
-        ...site,
-        material_cost: mats.total,
-        worker_count: wkrs.count,
-        worker_cost: wkrs.total,
-        expense_total: exps.total,
-        grand_total: parseFloat(mats.total) + parseFloat(wkrs.total) + parseFloat(exps.total),
-      });
-    }
+    const sites = await Site.find();
+    const result = await Promise.all(sites.map(async (site) => {
+      const [materialCost, workerInfo, expenseTotal] = await Promise.all([
+        Material.aggregate([ { $match: { site_id: site._id } }, { $group: { _id: null, total: { $sum: '$total_amount' } } } ]),
+        Worker.aggregate([ { $match: { site_id: site._id } }, { $group: { _id: null, count: { $sum: 1 }, total: { $sum: '$total_amount' } } } ]),
+        Expense.aggregate([ { $match: { site_id: site._id, status: 'approved' } }, { $group: { _id: null, total: { $sum: '$amount' } } } ])
+      ]);
+      const materialCostVal = materialCost[0]?.total ?? 0;
+      const workerCount = workerInfo[0]?.count ?? 0;
+      const workerCost = workerInfo[0]?.total ?? 0;
+      const expenseTotalVal = expenseTotal[0]?.total ?? 0;
+      return {
+        ...site.toObject(),
+        material_cost: materialCostVal,
+        worker_count: workerCount,
+        worker_cost: workerCost,
+        expense_total: expenseTotalVal,
+        grand_total: materialCostVal + workerCost + expenseTotalVal,
+      };
+    }));
     res.json(result);
   } catch (err) {
     console.error(err);
@@ -258,26 +259,39 @@ const getSiteWiseReport = async (req, res) => {
 
 const getTotalExpensesReport = async (req, res) => {
   try {
-    const [[materialTotal]] = await pool.query('SELECT COALESCE(SUM(total_amount),0) as total FROM materials');
-    const [[workerTotal]] = await pool.query('SELECT COALESCE(SUM(total_amount),0) as total FROM workers');
-    const [[expenseTotal]] = await pool.query('SELECT COALESCE(SUM(amount),0) as total FROM expenses WHERE status="approved"');
+    const [materialTotal, workerTotal, expenseTotal, byCategory, bySite] = await Promise.all([
+      Material.aggregate([{ $group: { _id: null, total: { $sum: '$total_amount' } } }]),
+      Worker.aggregate([{ $group: { _id: null, total: { $sum: '$total_amount' } } }]),
+      Expense.aggregate([{ $match: { status: 'approved' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+      Expense.aggregate([{ $match: { status: 'approved' } }, { $group: { _id: '$expense_head', total: { $sum: '$amount' } } }, { $project: { category: '$_id', total: 1, _id: 0 } }]),
+      Site.aggregate([
+        {
+          $lookup: {
+            from: 'expenses',
+            let: { siteId: '$_id' },
+            pipeline: [
+              { $match: { $expr: { $and: [{ $eq: ['$site_id', '$$siteId'] }, { $eq: ['$status', 'approved'] }] } } },
+              { $group: { _id: null, expense_total: { $sum: '$amount' } } }
+            ],
+            as: 'exp'
+          }
+        },
+        { $unwind: { path: '$exp', preserveNullAndEmptyArrays: true } },
+        { $project: { name: '$name', expense_total: { $ifNull: ['$exp.expense_total', 0] } } },
+        { $sort: { expense_total: -1 } }
+      ])
+    ]);
 
-    const [byCategory] = await pool.query(
-      `SELECT expense_head as category, SUM(amount) as total FROM expenses WHERE status='approved' GROUP BY expense_head`
-    );
-    const [bySite] = await pool.query(
-      `SELECT s.name, 
-        COALESCE(SUM(e.amount),0) as expense_total
-       FROM sites s LEFT JOIN expenses e ON e.site_id = s.id AND e.status='approved'
-       GROUP BY s.id, s.name ORDER BY expense_total DESC`
-    );
+    const materialCost = materialTotal[0]?.total ?? 0;
+    const workerCost = workerTotal[0]?.total ?? 0;
+    const otherExpenses = expenseTotal[0]?.total ?? 0;
 
     res.json({
       summary: {
-        material_cost: materialTotal.total,
-        worker_cost: workerTotal.total,
-        other_expenses: expenseTotal.total,
-        grand_total: parseFloat(materialTotal.total) + parseFloat(workerTotal.total) + parseFloat(expenseTotal.total),
+        material_cost: materialCost,
+        worker_cost: workerCost,
+        other_expenses: otherExpenses,
+        grand_total: materialCost + workerCost + otherExpenses,
       },
       byCategory,
       bySite,
